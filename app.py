@@ -3,8 +3,10 @@ from main import create_acc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import time
+from threading import Lock
 
 app = Flask(__name__)
+request_lock = Lock()  # Prevent concurrent API requests
 
 VALID_REGIONS = ['IND', 'ID', 'BR', 'ME', 'VN', 'TH', 'CIS', 'BD', 'PK', 'SG', 'NA', 'SAC', 'EU', 'TW']
 TOTAL_ACCOUNTS = 0
@@ -14,75 +16,98 @@ START_TIME = datetime.now()
 def generate_accounts():
     """Generate accounts via API - returns JSON"""
     global TOTAL_ACCOUNTS
-    start_time = time.time()
     
-    region = request.args.get('region', '').upper()
-    amount = request.args.get('amount', '10')
-    
-    # Validate region
-    if region not in VALID_REGIONS:
+    # Only allow one generation request at a time
+    if not request_lock.acquire(blocking=False):
         return jsonify({
-            'error': 'Invalid region',
-            'valid_regions': VALID_REGIONS
-        }), 400
+            'error': 'Another generation is in progress. Please wait.'
+        }), 429
     
-    # Validate amount
     try:
-        amount = int(amount)
-        if amount < 1 or amount > 100:
+        start_time = time.time()
+        
+        region = request.args.get('region', '').upper()
+        amount = request.args.get('amount', '10')
+        
+        # Validate region
+        if region not in VALID_REGIONS:
             return jsonify({
-                'error': 'Amount must be between 1 and 100'
+                'error': 'Invalid region',
+                'valid_regions': VALID_REGIONS
             }), 400
-    except ValueError:
-        return jsonify({
-            'error': 'Invalid amount parameter. Must be a number.'
-        }), 400
-    
-    accounts = []
-    max_workers = min(40, amount * 2)
-    
-    def generate_single_account():
+        
+        # Validate amount
         try:
-            max_attempts = 50  # Try up to 50 times to find rare UID
-            for _ in range(max_attempts):
+            amount = int(amount)
+            if amount < 1 or amount > 100:
+                return jsonify({
+                    'error': 'Amount must be between 1 and 100'
+                }), 400
+        except ValueError:
+            return jsonify({
+                'error': 'Invalid amount parameter. Must be a number.'
+            }), 400
+        
+        rare_accounts = []
+        all_accounts = []
+        total_checked = 0
+        max_workers = min(10, amount)
+        
+        def generate_single_account():
+            try:
                 result = create_acc(region, 'NAV')
                 if result and result.get('status_code') == 200:
                     account_id = result.get('account_id')
                     is_rare = result.get('is_rare', False)
                     
-                    if is_rare and account_id:
-                        return {
-                            'accountId': account_id,
-                            'password': result['password'],
-                            'uid': result['uid']
-                        }
-        except Exception as e:
-            print(f"Error: {e}")
-        return None
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit more tasks to account for filtering
-        futures = [executor.submit(generate_single_account) for _ in range(amount * 3)]
-        for future in as_completed(futures, timeout=600):
-            acc = future.result()
-            if acc:
-                accounts.append(acc)
-                if len(accounts) >= amount:
-                    # Cancel remaining futures
-                    for f in futures:
-                        f.cancel()
-                    break
-    
-    TOTAL_ACCOUNTS += len(accounts)
-    elapsed = round(time.time() - start_time, 2)
-    
-    return jsonify({
-        'region': region,
-        'requested': amount,
-        'generated': len(accounts),
-        'time_taken_sec': elapsed,
-        'accounts': accounts
-    })
+                    account_data = {
+                        'accountId': account_id,
+                        'password': result['password'],
+                        'uid': result['uid'],
+                        'is_rare': is_rare
+                    }
+                    return account_data
+            except Exception as e:
+                print(f"Error: {e}")
+            return None
+        
+        # Keep generating until we have enough rare accounts
+        max_attempts = amount * 50  # Check up to 50x accounts to find rare ones
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(generate_single_account) for _ in range(max_attempts)]
+            for future in as_completed(futures, timeout=600):
+                acc = future.result()
+                if acc:
+                    total_checked += 1
+                    all_accounts.append(acc)
+                    
+                    if acc.get('is_rare'):
+                        rare_accounts.append(acc)
+                        
+                    # Stop when we have enough rare accounts
+                    if len(rare_accounts) >= amount:
+                        for f in futures:
+                            f.cancel()
+                        break
+        
+        TOTAL_ACCOUNTS += len(rare_accounts)
+        elapsed = round(time.time() - start_time, 2)
+        
+        # Build response with rare accounts first
+        response_data = {
+            'rare_accounts': rare_accounts,
+            'rare_accounts_generated': len(rare_accounts),
+            'region': region,
+            'requested': amount,
+            'total_accounts_checked': total_checked,
+            'time_taken_sec': elapsed,
+            'all_accounts': all_accounts
+        }
+        
+        return jsonify(response_data)
+    finally:
+        request_lock.release()
 
 @app.route('/')
 def home():
